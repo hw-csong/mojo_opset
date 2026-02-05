@@ -53,12 +53,12 @@ def generate_test_data(
     [
         pytest.param(
             *generate_test_data(
-                q_head_num=8,
-                kv_head_num=2,
+                q_head_num=5,
+                kv_head_num=1,
                 head_dim=128,
-                max_seq_length=8192,
+                max_seq_length=32768,
                 block_size=8,
-                sample_min=128,
+                sample_min=1024,
                 sample_max=1024,
             )
         ),
