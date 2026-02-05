@@ -408,6 +408,7 @@ def kernel_da_fwd_u(
             block_lse = tl.log(block_l) + block_m
             tl.store(ptr_o, block_o.to(LOW_TYPE), mask=mask_q)
             tl.store(ptr_fp32o, block_o, mask=mask_q)
+            tl.compile_hint(block_lse, 'mayDiscretememaccess')
             tl.store(ptr_lse, block_lse, mask=mask_lse)
 
         seq_st = seq_ed
