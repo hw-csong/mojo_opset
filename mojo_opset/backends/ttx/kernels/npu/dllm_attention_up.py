@@ -64,7 +64,9 @@ def micro_kernel_fwd(
     block_s = tl.dot(block_q, block_k) * scale
     block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
     if block_mask is not None:
-        block_s += block_mask
+        # FIXME compiler issue.Current impl is tl.where(cond, when False, when True)
+        block_s = tl.where(block_mask, -1.0e6, block_s)
+        tl.compile_hint(block_s, "bitwise_mask")
     block_m_1 = tl.maximum(block_m, tl.max(block_s, axis=1))
     block_s = tl.exp(block_s - block_m_1[:, None])
     block_l_1 = tl.exp(block_m - block_m_1) * block_l + tl.sum(block_s, axis=1)
@@ -184,7 +186,7 @@ def micro_kernel_bwd_kv(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 64, "BLOCK_C": 128},
+            {"BLOCK_R": 64, "BLOCK_C": 256},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -282,15 +284,6 @@ def kernel_da_fwd_u(
             block_l = tl.full([BLOCK_R], 0.0, dtype=HIGH_TYPE)
             block_m = tl.full([BLOCK_R], -1e6, dtype=HIGH_TYPE)
 
-            block_mask_shape = (
-                (seq_st + idx_r * BLOCK_R + offset_r_local < seq_ed) &
-                (seq_st + idx_r * BLOCK_R + offset_c_local < seq_ed)
-            )
-            block_mask_bool = (
-                block_mask_full_ul & block_mask_shape
-            )
-            block_mask = (block_mask_bool.to(HIGH_TYPE) - 1.0) * 1e6
-
             block_o, block_m, block_l = micro_kernel_fwd(
                 block_q,
                 k,
@@ -301,7 +294,7 @@ def kernel_da_fwd_u(
                 scale,
                 seq_st + idx_r * BLOCK_R,
                 seq_ed,
-                block_mask,
+                block_mask_full_ul,
                 idx_n,
                 idx_h,
                 STRIDE_K_S,
@@ -316,11 +309,6 @@ def kernel_da_fwd_u(
                 HIGH_TYPE,
             )
 
-            block_mask_bool = (
-                block_mask_full_ur & block_mask_shape
-            )
-            block_mask = (block_mask_bool.to(LOW_TYPE) - 1.0) * 1e6
-
             block_o, block_m, block_l = micro_kernel_fwd(
                 block_q,
                 k,
@@ -331,7 +319,7 @@ def kernel_da_fwd_u(
                 scale,
                 S + seq_st + idx_r * BLOCK_R,
                 S + seq_ed,
-                block_mask,
+                block_mask_full_ur,
                 idx_n,
                 idx_h,
                 STRIDE_K_S,
@@ -1034,6 +1022,31 @@ def kernel_da_bwd_kv_ur(
         offset_block_c_st = offset_block_c_ed
 
 
+def packed_bool_to_i8(bool_mask: torch.Tensor) -> torch.Tensor:
+    orig_shape = bool_mask.shape
+    assert orig_shape[-1] % 8 == 0
+
+    flat_mask = bool_mask.flatten()
+
+    flat_len = flat_mask.numel()
+    num_packed = flat_len // 8
+    mask_8group = flat_mask.reshape(num_packed, 8)
+
+    weights = torch.tensor(
+        [1 << i for i in range(0, 8)],
+        dtype=torch.uint8,
+        device=bool_mask.device
+    )
+    packed_vals = (mask_8group.to(torch.uint8) * weights).sum(dim=-1, dtype=torch.uint8)
+    
+    padded_flat = torch.cat([
+        packed_vals,
+        torch.zeros(flat_len - num_packed, dtype=torch.uint8, device=bool_mask.device)
+    ], dim=0)
+        
+    return padded_flat.reshape(orig_shape)
+
+
 def dllm_attention_up_fwd_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1078,8 +1091,13 @@ def dllm_attention_up_fwd_impl(
         offset_c_local = torch.arange(0, BLOCK_MASK)[None, :]
         chunk_idx_r = offset_r_local // BLOCK_SIZE
         chunk_idx_c = offset_c_local // BLOCK_SIZE
-        dllm_attention_up_fwd_impl.mask_ur = (chunk_idx_r > chunk_idx_c).to(q.device)
-        dllm_attention_up_fwd_impl.mask_ul = (chunk_idx_r == chunk_idx_c).to(q.device)
+
+        # mask_ur = (chunk_idx_r > chunk_idx_c)
+        # mask_ul = (chunk_idx_r == chunk_idx_c)
+        mask_ur = packed_bool_to_i8((chunk_idx_r > chunk_idx_c))
+        mask_ul = packed_bool_to_i8((chunk_idx_r == chunk_idx_c))
+        dllm_attention_up_fwd_impl.mask_ur = mask_ur.to(q.device)
+        dllm_attention_up_fwd_impl.mask_ul = mask_ul.to(q.device)
 
     kernel_da_fwd_u[(num_cores,)](
         q,
