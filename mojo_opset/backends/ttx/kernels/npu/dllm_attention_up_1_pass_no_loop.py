@@ -7,6 +7,9 @@ import torch
 import triton
 import triton.language as tl
 
+FWD_BLOCK_R=64
+FWD_BLOCK_C=256
+
 
 @cache
 def get_device_properties() -> Tuple[int, int]:
@@ -41,33 +44,33 @@ def micro_kernel_fwd(
     STRIDE_V_N: tl.constexpr,
     STRIDE_V_H: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
     LOW_TYPE,
     HIGH_TYPE,
-    tile_r_mask = False,
 ):
     ptr_k = (
         k
         + (idx_n // GROUP_SIZE) * STRIDE_K_N
-        + (offset_c + tl.arange(0, BLOCK_C))[:, None] * STRIDE_K_S
+        + (offset_c + tl.arange(0, BLOCK_KV))[:, None] * STRIDE_K_S
         + idx_h[None, :] * STRIDE_K_H
     )
     ptr_v = (
         v
         + (idx_n // GROUP_SIZE) * STRIDE_V_N
-        + (offset_c + tl.arange(0, BLOCK_C))[:, None] * STRIDE_V_S
+        + (offset_c + tl.arange(0, BLOCK_KV))[:, None] * STRIDE_V_S
         + idx_h[None, :] * STRIDE_V_H
     )
 
-    mask_kv = (offset_c + tl.arange(0, BLOCK_C)) < offset_c_ed
-    block_k = tl.load(ptr_k, mask=mask_kv[:, None], other=0.0)
+    mask_kv = (offset_c + tl.arange(0, BLOCK_KV))[:, None] < offset_c_ed
+    block_k = tl.load(ptr_k, mask=mask_kv, other=0.0)
     block_k = tl.trans(block_k)
     block_s = tl.dot(block_q, block_k) * scale
-    block_v = tl.load(ptr_v, mask=mask_kv[:, None], other=0.0)
+    block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
     if block_mask is not None:
-        block_s += block_mask
-    elif tile_r_mask:
-        block_s += tl.where(mask_kv[None, :], 0.0, -1e6)
+        block_s = tl.where(block_mask, block_s, -1.0e6)
+    mask_s_kv = (offset_c + tl.arange(0, BLOCK_KV) < offset_c_ed)[None, :]
+    block_s = tl.where(mask_s_kv, block_s, -1.0e6)
     block_m_1 = tl.maximum(block_m, tl.max(block_s, axis=1))
     block_s = tl.exp(block_s - block_m_1[:, None])
     block_l_1 = tl.exp(block_m - block_m_1) * block_l + tl.sum(block_s, axis=1)
@@ -187,7 +190,7 @@ def micro_kernel_bwd_kv(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 64, "BLOCK_C": 512},
+            {"BLOCK_R": FWD_BLOCK_R, "BLOCK_C": FWD_BLOCK_C},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -285,15 +288,6 @@ def kernel_da_fwd_u(
             block_l = tl.full([BLOCK_R], 0.0, dtype=HIGH_TYPE)
             block_m = tl.full([BLOCK_R], -1e6, dtype=HIGH_TYPE)
 
-            block_mask_shape = (
-                (seq_st + idx_r * BLOCK_R + offset_r_local < seq_ed) &
-                (seq_st + idx_r * BLOCK_R + offset_c_local < seq_ed)
-            )
-            block_mask_bool = (
-                block_mask_full_ul & block_mask_shape
-            )
-            block_mask = (block_mask_bool.to(HIGH_TYPE) - 1.0) * 1e6
-
             block_o, block_m, block_l = micro_kernel_fwd(
                 block_q,
                 k,
@@ -304,7 +298,7 @@ def kernel_da_fwd_u(
                 scale,
                 seq_st + idx_r * BLOCK_R,
                 seq_ed,
-                block_mask,
+                block_mask_full_ul,
                 idx_n,
                 idx_h,
                 STRIDE_K_S,
@@ -315,14 +309,10 @@ def kernel_da_fwd_u(
                 STRIDE_V_H,
                 GROUP_SIZE,
                 BLOCK_R,
+                BLOCK_R,
                 LOW_TYPE,
                 HIGH_TYPE,
             )
-
-            block_mask_bool = (
-                block_mask_full_ur & block_mask_shape
-            )
-            block_mask = (block_mask_bool.to(LOW_TYPE) - 1.0) * 1e6
 
             block_o, block_m, block_l = micro_kernel_fwd(
                 block_q,
@@ -334,7 +324,7 @@ def kernel_da_fwd_u(
                 scale,
                 S + seq_st + idx_r * BLOCK_R,
                 S + seq_ed,
-                block_mask,
+                block_mask_full_ur,
                 idx_n,
                 idx_h,
                 STRIDE_K_S,
@@ -344,6 +334,7 @@ def kernel_da_fwd_u(
                 STRIDE_V_N,
                 STRIDE_V_H,
                 GROUP_SIZE,
+                BLOCK_R,
                 BLOCK_R,
                 LOW_TYPE,
                 HIGH_TYPE,
@@ -372,10 +363,10 @@ def kernel_da_fwd_u(
                     STRIDE_V_N,
                     STRIDE_V_H,
                     GROUP_SIZE,
+                    BLOCK_R,
                     BLOCK_C - BLOCK_R,
                     LOW_TYPE,
                     HIGH_TYPE,
-                    tile_r_mask = True,
                 )
 
             for idx_c in range(idx_r * BLOCK_R // BLOCK_C):
@@ -399,6 +390,7 @@ def kernel_da_fwd_u(
                     STRIDE_V_N,
                     STRIDE_V_H,
                     GROUP_SIZE,
+                    BLOCK_C,
                     BLOCK_C,
                     LOW_TYPE,
                     HIGH_TYPE,
