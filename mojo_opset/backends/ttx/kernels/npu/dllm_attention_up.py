@@ -51,6 +51,7 @@ def micro_kernel_fwd(
     tbuf = None,
     STRIDE_BUF_R: tl.constexpr = 0,
     STRIDE_BUF_C: tl.constexpr = 0,
+    enable_bitmask=False,
 ):
     ptr_k = (
         k
@@ -84,7 +85,12 @@ def micro_kernel_fwd(
     block_s_sub = tl.load(tbuf + offs_sub_buf, mask=(offset_c + tl.arange(0, BLOCK_KV))[None, :] < offset_c_ed, othe=-1.0e6)
     # vec calculate
     block_s_sub = block_s_sub * scale
-    if block_mask is not None:
+    if block_mask is not None and enable_bitmask:
+        sub_block_mask = block_mask[sub_vec_id * SUB_BLOCK_Q : (sub_vec_id + 1) * SUB_BLOCK_Q, :]
+        # FIXME compiler issue.Current impl is tl.where(cond, when False, when True)
+        block_s_sub = tl.where(sub_block_mask, -1.0e6, block_s_sub)
+        tl.compile_hint(block_s, "bitwise_mask")
+    elif block_mask is not None:
         sub_block_mask = block_mask[sub_vec_id * SUB_BLOCK_Q : (sub_vec_id + 1) * SUB_BLOCK_Q, :]
         block_s_sub += sub_block_mask
     block_m_1 = tl.maximum(block_m, tl.max(block_s_sub, axis=1))
@@ -344,6 +350,7 @@ def kernel_da_fwd_u(
                 tbuf=tbuf + pid * STRIDE_BUF_P,
                 STRIDE_BUF_R=STRIDE_BUF_R,
                 STRIDE_BUF_C=STRIDE_BUF_C,
+                enable_bitmask=True,
             )
 
             block_o, block_m, block_l = micro_kernel_fwd(
@@ -373,6 +380,7 @@ def kernel_da_fwd_u(
                 tbuf=tbuf + pid * STRIDE_BUF_P,
                 STRIDE_BUF_R=STRIDE_BUF_R,
                 STRIDE_BUF_C=STRIDE_BUF_C,
+                enable_bitmask=True,
             )
 
             idx_tile_r = idx_r * BLOCK_R // BLOCK_C * BLOCK_C // BLOCK_R
@@ -1189,6 +1197,41 @@ def kernel_da_bwd_kv_ur(
         offset_block_c_st = offset_block_c_ed
 
 
+def packed_bool_to_i8_with_block(
+        bool_mask: torch.Tensor,
+        block_num: Optional[int] = 1
+) -> torch.Tensor:
+    orig_shape = bool_mask.shape
+    assert orig_shape[-1] % 8 == 0
+
+    assert (bool_mask.numel() // orig_shape[-1]) % block_num == 0, f"{bool_mask.numel() = } {orig_shape=}"
+    bool_mask_blocked = bool_mask.reshape(block_num, -1, orig_shape[-1])
+
+    result = []
+    for i in range(block_num):
+        flat_mask = bool_mask_blocked[i].flatten()
+
+        flat_len = flat_mask.numel()
+        num_packed = flat_len // 8
+        mask_8group = flat_mask.reshape(num_packed, 8)
+
+        weights = torch.tensor(
+            [1 << i for i in range(0, 8)],
+            dtype=torch.uint8,
+            device=bool_mask.device
+        )
+        packed_vals = (mask_8group.to(torch.uint8) * weights).sum(dim=-1, dtype=torch.uint8)
+
+        padded_flat = torch.cat([
+            packed_vals,
+            torch.zeros(flat_len - num_packed, dtype=torch.uint8, device=bool_mask.device)
+        ], dim=0)
+        result.append(padded_flat)
+    padded_flat = torch.cat(result, dim=0)
+
+    return padded_flat.reshape(orig_shape)
+
+
 def dllm_attention_up_fwd_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1238,8 +1281,11 @@ def dllm_attention_up_fwd_impl(
         offset_c_local = torch.arange(0, BLOCK_MASK)[None, :]
         chunk_idx_r = offset_r_local // BLOCK_SIZE
         chunk_idx_c = offset_c_local // BLOCK_SIZE
-        dllm_attention_up_fwd_impl.mask_ur = (chunk_idx_r > chunk_idx_c).to(q.device)
-        dllm_attention_up_fwd_impl.mask_ul = (chunk_idx_r == chunk_idx_c).to(q.device)
+
+        mask_ur = packed_bool_to_i8_with_block((chunk_idx_r > chunk_idx_c), al.sub_vec_num())
+        mask_ul = packed_bool_to_i8_with_block((chunk_idx_r == chunk_idx_c), al.sub_vec_num())
+        dllm_attention_up_fwd_impl.mask_ur = mask_ur.to(q.device)
+        dllm_attention_up_fwd_impl.mask_ul = mask_ul.to(q.device)
 
     kernel_da_fwd_u[(num_cores,)](
         q,
