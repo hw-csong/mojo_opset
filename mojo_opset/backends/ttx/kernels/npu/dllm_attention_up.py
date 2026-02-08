@@ -375,7 +375,14 @@ def kernel_da_fwd_u(
                 STRIDE_BUF_C=STRIDE_BUF_C,
             )
 
-            for idx_tile_r in range(idx_r * BLOCK_R // BLOCK_C * BLOCK_C // BLOCK_R, idx_r):
+            idx_tile_r = idx_r * BLOCK_R // BLOCK_C * BLOCK_C // BLOCK_R
+            loop_count = tl.maximum(0, idx_r - idx_tile_r)
+            if loop_count > 0:
+                offset_c = S + seq_st + idx_tile_r * BLOCK_R
+                offset_c_ed = S + tl.minimum(seq_ed, seq_st + idx_r * BLOCK_R)
+                block_mask_bool = (offset_c + tl.arange(0, BLOCK_C - BLOCK_R))[None, :] < offset_c_ed
+                block_mask = (block_mask_bool.to(LOW_TYPE) - 1.0) * 1e6
+
                 block_o, block_m, block_l = micro_kernel_fwd(
                     block_q,
                     k,
@@ -384,9 +391,9 @@ def kernel_da_fwd_u(
                     block_m,
                     block_l,
                     scale,
-                    S + seq_st + idx_tile_r * BLOCK_R,
-                    S + seq_ed,
-                    None,
+                    offset_c,
+                    offset_c_ed,
+                    block_mask,
                     idx_n,
                     idx_h,
                     STRIDE_K_S,
