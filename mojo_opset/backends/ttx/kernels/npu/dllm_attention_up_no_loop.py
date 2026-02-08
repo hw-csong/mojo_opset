@@ -8,6 +8,10 @@ import triton
 import triton.language as tl
 
 
+FWD_BLOCK_R=64
+FWD_BLOCK_C=256
+
+
 @cache
 def get_device_properties() -> Tuple[int, int]:
     device = torch.npu.current_device()
@@ -44,7 +48,7 @@ def micro_kernel_fwd(
     BLOCK_C: tl.constexpr,
     LOW_TYPE,
     HIGH_TYPE,
-    tile_r_mask = False,
+    enable_bitmask=False,
 ):
     ptr_k = (
         k
@@ -64,13 +68,12 @@ def micro_kernel_fwd(
     block_k = tl.trans(block_k)
     block_s = tl.dot(block_q, block_k) * scale
     block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
-    if block_mask is not None:
+    if block_mask is not None and enable_bitmask:
         # FIXME compiler issue.Current impl is tl.where(cond, when False, when True)
         block_s = tl.where(block_mask, -1.0e6, block_s)
         tl.compile_hint(block_s, "bitwise_mask")
-    elif tile_r_mask:
-        mask_s = (offset_c + tl.arange(0, BLOCK_C))[None, :] < offset_c_ed
-        block_s += tl.where(mask_s, 0, -1.0e6)
+    elif block_mask is not None:
+        block_s += block_mask
     block_m_1 = tl.maximum(block_m, tl.max(block_s, axis=1))
     block_s = tl.exp(block_s - block_m_1[:, None])
     block_l_1 = tl.exp(block_m - block_m_1) * block_l + tl.sum(block_s, axis=1)
@@ -190,7 +193,7 @@ def micro_kernel_bwd_kv(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 64, "BLOCK_C": 512},
+            {"BLOCK_R": FWD_BLOCK_R, "BLOCK_C": FWD_BLOCK_C},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -311,6 +314,7 @@ def kernel_da_fwd_u(
                 BLOCK_R,
                 LOW_TYPE,
                 HIGH_TYPE,
+                enable_bitmask=True
             )
 
             block_o, block_m, block_l = micro_kernel_fwd(
@@ -336,11 +340,17 @@ def kernel_da_fwd_u(
                 BLOCK_R,
                 LOW_TYPE,
                 HIGH_TYPE,
+                enable_bitmask=True
             )
 
             idx_tile_r = idx_r * BLOCK_R // BLOCK_C * BLOCK_C // BLOCK_R
             loop_count = tl.maximum(0, idx_r - idx_tile_r)
             if loop_count > 0:
+                offset_c = S + seq_st + idx_tile_r * BLOCK_R
+                offset_c_ed = S + tl.minimum(seq_ed, seq_st + idx_r * BLOCK_R)
+                block_mask_bool = (offset_c + tl.arange(0, BLOCK_C - BLOCK_R))[None, :] < offset_c_ed
+                block_mask = ((block_mask_bool.to(LOW_TYPE) - 1) * 1.0e6)
+
                 block_o, block_m, block_l = micro_kernel_fwd(
                     block_q,
                     k,
@@ -349,9 +359,9 @@ def kernel_da_fwd_u(
                     block_m,
                     block_l,
                     scale,
-                    S + seq_st + idx_tile_r * BLOCK_R,
-                    S + tl.minimum(seq_ed, seq_st + idx_r * BLOCK_R),
-                    None,
+                    offset_c,
+                    offset_c_ed,
+                    block_mask,
                     idx_n,
                     idx_h,
                     STRIDE_K_S,
@@ -364,7 +374,6 @@ def kernel_da_fwd_u(
                     BLOCK_C - BLOCK_R,
                     LOW_TYPE,
                     HIGH_TYPE,
-                    tile_r_mask = True,
                 )
 
             for idx_c in range(idx_r * BLOCK_R // BLOCK_C):
