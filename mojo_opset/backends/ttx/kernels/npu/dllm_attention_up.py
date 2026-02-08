@@ -207,7 +207,8 @@ def kernel_da_fwd_u(
     v,
     o,
     fp32o,
-    lse,
+    m,
+    l,
     cu_seqlens,
     num_seqs,
     scale,
@@ -280,7 +281,7 @@ def kernel_da_fwd_u(
                 + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_Q_S
                 + idx_h[None, :] * STRIDE_Q_H
             )
-            ptr_lse = lse + idx_n * STRIDE_D_N + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:] * STRIDE_D_S
+            offs_lse = idx_n * STRIDE_D_N + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:] * STRIDE_D_S
 
             mask_q = (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] < seq_ed
             mask_lse = (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:] < seq_ed
@@ -365,6 +366,112 @@ def kernel_da_fwd_u(
                     LOW_TYPE,
                     HIGH_TYPE,
                 )
+
+            tl.store(ptr_o, block_o.to(LOW_TYPE), mask=mask_q)
+            tl.store(ptr_fp32o, block_o, mask=mask_q)
+
+            tl.store(m + offs_lse, block_m, mask = mask_lse)
+            tl.store(l + offs_lse, block_l, mask = mask_lse)
+
+        seq_st = seq_ed
+        offset_block_r_st = offset_block_r_ed
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_R": FWD_BLOCK_R, "BLOCK_C": FWD_BLOCK_C},
+            # multibuffer=True,
+            # unit_flag=True,
+            # set_workspace_multibuffer=2,
+            # enable_hivm_auto_cv_balance=True,
+            # tile_mix_vector_loop=2,
+            # tile_mix_cube_loop=2,
+        )
+    ],
+    key=["N", "H"],
+)
+@triton.jit(do_not_specialize=["cu_seqlens", "num_seqs", "S"])
+def kernel_da_fwd_u2(
+    q,
+    k,
+    v,
+    o,
+    fp32o,
+    lse,
+    m,
+    l,
+    cu_seqlens,
+    num_seqs,
+    scale,
+    GROUP_SIZE: tl.constexpr,
+    S,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    STRIDE_Q_S: tl.constexpr,
+    STRIDE_Q_N: tl.constexpr,
+    STRIDE_Q_H: tl.constexpr,
+    STRIDE_K_S: tl.constexpr,
+    STRIDE_K_N: tl.constexpr,
+    STRIDE_K_H: tl.constexpr,
+    STRIDE_V_S: tl.constexpr,
+    STRIDE_V_N: tl.constexpr,
+    STRIDE_V_H: tl.constexpr,
+    STRIDE_D_S: tl.constexpr,
+    STRIDE_D_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LOW_TYPE: tl.constexpr = tl.bfloat16,
+    HIGH_TYPE: tl.constexpr = tl.float32,
+    # MAX_NUM_SEQ: tl.constexpr = 1024,
+):
+    pid = tl.program_id(axis=0)
+    pnum = tl.num_programs(axis=0)
+
+    seq_st = 0
+    offset_block_r_st = 0
+
+    for idx_seq in range(num_seqs):
+        seq_ed = tl.load(cu_seqlens + idx_seq)
+        offset_block_r_ed = offset_block_r_st + tl.cdiv(seq_ed - seq_st, BLOCK_R)
+        for task_id in range(
+            offset_block_r_st * N + ((pid % pnum - offset_block_r_st * N % pnum + pnum) % pnum),
+            offset_block_r_ed * N,
+            pnum,
+        ):
+            idx_r = task_id // N - offset_block_r_st
+            idx_n = task_id % N
+            idx_h = tl.arange(0, H)
+
+            ptr_q = (
+                q
+                + idx_n * STRIDE_Q_N
+                + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_Q_S
+                + idx_h[None, :] * STRIDE_Q_H
+            )
+            ptr_o = (
+                o
+                + idx_n * STRIDE_Q_N
+                + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_Q_S
+                + idx_h[None, :] * STRIDE_Q_H
+            )
+            ptr_fp32o = (
+                fp32o
+                + idx_n * STRIDE_Q_N
+                + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_Q_S
+                + idx_h[None, :] * STRIDE_Q_H
+            )
+            offs_m_l = idx_n * STRIDE_D_N + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:] * STRIDE_D_S
+            ptr_lse = lse + offs_m_l
+
+            mask_q = (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] < seq_ed
+            mask_lse = (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:] < seq_ed
+
+            block_q = tl.load(ptr_q, mask=mask_q, other=0.0)
+            block_o = tl.load(ptr_fp32o, mask=mask_q).to(HIGH_TYPE)
+            block_l = tl.load(l + offs_m_l, mask=mask_lse, other=0.0)
+            block_m = tl.load(m + offs_m_l, mask=mask_lse, other=-1e6)
 
             for idx_c in range(idx_r * BLOCK_R // BLOCK_C):
                 block_o, block_m, block_l = micro_kernel_fwd(
@@ -1066,6 +1173,9 @@ def dllm_attention_up_fwd_impl(
     lse = torch.zeros((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
     num_cores, _ = get_device_properties()
 
+    m = torch.zeros((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
+    l = torch.full((q.shape[0], q.shape[1]), fill_value=-1e6, device=q.device, dtype=torch.float32)
+
     if (not hasattr(dllm_attention_up_fwd_impl, "inited")):
         dllm_attention_up_fwd_impl.inited = True
         BLOCK_MASK = 64
@@ -1082,7 +1192,8 @@ def dllm_attention_up_fwd_impl(
         v,
         o,
         o_f32,
-        lse,
+        m,
+        l,
         cu_seqlen,
         cu_seqlen.shape[0],
         scale,
@@ -1104,6 +1215,36 @@ def dllm_attention_up_fwd_impl(
         lse.stride(0),
         lse.stride(1),
         dllm_attention_up_fwd_impl.mask_ul.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    kernel_da_fwd_u2[(num_cores,)](
+        q,
+        k,
+        v,
+        o,
+        o_f32,
+        lse,
+        m,
+        l,
+        cu_seqlen,
+        cu_seqlen.shape[0],
+        scale,
+        q.shape[1] // k.shape[1],
+        q.shape[0] // 2,
+        q.shape[1],
+        q.shape[2],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        lse.stride(0),
+        lse.stride(1),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
