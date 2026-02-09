@@ -8,10 +8,6 @@ import triton
 import triton.language as tl
 
 
-FWD_BLOCK_R=64
-FWD_BLOCK_C=256
-
-
 @cache
 def get_device_properties() -> Tuple[int, int]:
     device = torch.npu.current_device()
@@ -69,8 +65,7 @@ def micro_kernel_fwd(
     block_s = tl.dot(block_q, block_k) * scale
     block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
     if block_mask is not None and enable_bitmask:
-        # FIXME compiler issue.Current impl is tl.where(cond, when False, when True)
-        block_s = tl.where(block_mask, -1.0e6, block_s)
+        block_s = tl.where(block_mask, block_s, -1.0e6)
         tl.compile_hint(block_s, "bitwise_mask")
     elif block_mask is not None:
         block_s += block_mask
@@ -128,7 +123,8 @@ def micro_kernel_bwd_q(
     block_k = tl.load(ptr_k, mask=mask_kv, other=0.0)
     block_s = tl.dot(block_q, block_k.T).to(HIGH_TYPE) * scale
     if block_mask is not None:
-        block_s += block_mask
+        block_s = tl.where(block_mask, block_s, -1.0e6)
+        # tl.compile_hint(block_s, "bitwise_mask")
     block_p = tl.exp(block_s - block_lse[:, None])
     block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
     block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
@@ -178,7 +174,8 @@ def micro_kernel_bwd_kv(
     block_lse = tl.load(ptr_lse, mask=mask_d, other=0.0)
     block_s = tl.dot(block_q, block_k).to(HIGH_TYPE) * scale
     if block_mask is not None:
-        block_s += block_mask
+        block_s = tl.where(block_mask, block_s, -1.0e6)
+        # tl.compile_hint(block_s, "bitwise_mask")
     block_do = tl.load(ptr_do, mask=mask_q, other=0.0)
     block_p = tl.exp(block_s - block_lse[:, None])
     block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
@@ -193,7 +190,7 @@ def micro_kernel_bwd_kv(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": FWD_BLOCK_R, "BLOCK_C": FWD_BLOCK_C},
+            {"BLOCK_R": 64, "BLOCK_C": 256},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -469,7 +466,7 @@ def kernel_da_bwd_d(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 64, "BLOCK_C": 128},
+            {"BLOCK_R": 64, "BLOCK_C": 256},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -567,14 +564,6 @@ def kernel_da_bwd_q_u(
             block_lse = tl.load(ptr_lse, mask=mask_d, other=0.0)
             block_d = tl.load(ptr_d, mask=mask_d, other=0.0)
             block_dq = tl.full([BLOCK_R, H], 0.0, dtype=HIGH_TYPE)
-            block_mask_shape = (
-                (seq_st + idx_r * BLOCK_R + offset_r_local < seq_ed) &
-                (seq_st + idx_r * BLOCK_R + offset_c_local < seq_ed)
-            )
-            block_mask_bool = (
-                block_mask_full_ul & block_mask_shape
-            )
-            block_mask = (block_mask_bool.to(LOW_TYPE) - 1.0) * 1e6
 
             block_dq = micro_kernel_bwd_q(
                 block_q,
@@ -587,7 +576,7 @@ def kernel_da_bwd_q_u(
                 scale,
                 seq_st + idx_r * BLOCK_R,
                 seq_ed,
-                block_mask,
+                block_mask_full_ul,
                 idx_n,
                 idx_h,
                 STRIDE_K_S,
@@ -602,10 +591,6 @@ def kernel_da_bwd_q_u(
                 HIGH_TYPE,
             )
 
-            block_mask_bool = (
-                block_mask_full_ur & block_mask_shape
-            )
-            block_mask = (block_mask_bool.to(LOW_TYPE) - 1.0) * 1e6
             block_dq = micro_kernel_bwd_q(
                 block_q,
                 k,
@@ -617,7 +602,7 @@ def kernel_da_bwd_q_u(
                 scale,
                 S + seq_st + idx_r * BLOCK_R,
                 S + seq_ed,
-                block_mask,
+                block_mask_full_ur,
                 idx_n,
                 idx_h,
                 STRIDE_K_S,
@@ -801,13 +786,6 @@ def kernel_da_bwd_kv_ul(
             for idx_ingroup in range(GROUP_SIZE):
                 idx_n = idx_group * GROUP_SIZE + idx_ingroup
 
-                block_mask_bool = (
-                    block_mask_full_ul
-                    & (seq_st + idx_c * BLOCK_C + offs_r_local < seq_ed)
-                    & (seq_st + idx_c * BLOCK_C + offs_c_local < seq_ed)
-                )
-                block_mask = (block_mask_bool.to(LOW_TYPE) - 1.0) * 1e6
-
                 block_dk, block_dv = micro_kernel_bwd_kv(
                     q,
                     block_k,
@@ -820,7 +798,7 @@ def kernel_da_bwd_kv_ul(
                     scale,
                     seq_st + idx_c * BLOCK_C,
                     seq_ed,
-                    block_mask,
+                    block_mask_full_ul,
                     idx_n,
                     idx_h,
                     STRIDE_Q_S,
@@ -842,7 +820,7 @@ def kernel_da_bwd_kv_ul(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 128, "BLOCK_C": 64},
+            {"BLOCK_R": 256, "BLOCK_C": 64},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -949,13 +927,6 @@ def kernel_da_bwd_kv_ur(
             for idx_ingroup in range(GROUP_SIZE):
                 idx_n = idx_group * GROUP_SIZE + idx_ingroup
 
-                block_mask_bool = (
-                    block_mask_full_ur
-                    & (seq_st + idx_c * BLOCK_C + offs_r_local < seq_ed)
-                    & (seq_st + idx_c * BLOCK_C + offs_c_local < seq_ed)
-                )
-                block_mask = (block_mask_bool.to(LOW_TYPE) - 1.0) * 1e6
-
                 block_dk, block_dv = micro_kernel_bwd_kv(
                     q,
                     block_k,
@@ -968,7 +939,7 @@ def kernel_da_bwd_kv_ur(
                     scale,
                     seq_st + idx_c * BLOCK_C,
                     seq_ed,
-                    block_mask,
+                    block_mask_full_ur,
                     idx_n,
                     idx_h,
                     STRIDE_Q_S,
@@ -1109,12 +1080,10 @@ def dllm_attention_up_fwd_impl(
         chunk_idx_r = offset_r_local // BLOCK_SIZE
         chunk_idx_c = offset_c_local // BLOCK_SIZE
 
-        # mask_ur = (chunk_idx_r > chunk_idx_c)
-        # mask_ul = (chunk_idx_r == chunk_idx_c)
-        mask_ur = packed_bool_to_i8((chunk_idx_r > chunk_idx_c))
-        mask_ul = packed_bool_to_i8((chunk_idx_r == chunk_idx_c))
-        dllm_attention_up_fwd_impl.mask_ur = mask_ur.to(q.device)
-        dllm_attention_up_fwd_impl.mask_ul = mask_ul.to(q.device)
+        mask_ur_i8 = packed_bool_to_i8((chunk_idx_r > chunk_idx_c))
+        mask_ul_i8 = packed_bool_to_i8((chunk_idx_r == chunk_idx_c))
+        dllm_attention_up_fwd_impl.mask_ur = mask_ur_i8.to(q.device)
+        dllm_attention_up_fwd_impl.mask_ul = mask_ul_i8.to(q.device)
 
     kernel_da_fwd_u[(num_cores,)](
         q,
@@ -1197,7 +1166,7 @@ def dllm_attention_up_bwd_impl(
 
     if (not hasattr(dllm_attention_up_bwd_impl, "inited")):
         dllm_attention_up_bwd_impl.inited = True
-        BLOCK_MASK = 64
+        BLOCK_MASK = 256
         offset_r_local = torch.arange(0, BLOCK_MASK)[:, None]
         offset_c_local = torch.arange(0, BLOCK_MASK)[None, :]
         chunk_idx_r = offset_r_local // BLOCK_SIZE
@@ -1205,6 +1174,11 @@ def dllm_attention_up_bwd_impl(
         dllm_attention_up_bwd_impl.mask_ul = (chunk_idx_r == chunk_idx_c).to(q.device)
         dllm_attention_up_bwd_impl.mask_ur = (chunk_idx_r > chunk_idx_c).to(q.device)
 
+        # mask_ul_i8 = packed_bool_to_i8((chunk_idx_r == chunk_idx_c)).to(q.device)
+        # mask_ur_i8 = packed_bool_to_i8((chunk_idx_r > chunk_idx_c)).to(q.device)
+        # dllm_attention_up_bwd_impl.mask_ul = (mask_ul_i8)
+        # dllm_attention_up_bwd_impl.mask_ur = (mask_ur_i8)
+        
     kernel_da_bwd_d[(num_vectorcore,)](
         fp32o,
         do,
@@ -1308,7 +1282,7 @@ def dllm_attention_up_bwd_impl(
         v.stride(2),
         d.stride(0),
         d.stride(1),
-        dllm_attention_up_bwd_impl.mask_ul.stride(0),
+        dllm_attention_up_bwd_impl.mask_ur.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
