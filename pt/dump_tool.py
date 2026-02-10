@@ -10,7 +10,7 @@ golden_mask = torch.load('./q_golden_mask.pt')
 bit_mask = torch.load('./q_bit_mask.pt')
 
 for i in range(0, 64, 8):
-    offset_st = i
+    offset_st = i + 8
     offset_ed = i + 8
     
     res = torch.allclose(
