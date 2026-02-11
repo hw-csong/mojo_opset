@@ -164,6 +164,8 @@ def micro_kernel_bwd_kv(
     BLOCK_R: tl.constexpr,
     LOW_TYPE,
     HIGH_TYPE,
+    block_qk = None,
+    block_qk_mask = None,
 ):
     ptr_q = (
         q + idx_n * STRIDE_Q_N + (offset_r + tl.arange(0, BLOCK_R))[:, None] * STRIDE_Q_S + idx_h[None, :] * STRIDE_Q_H
@@ -180,9 +182,13 @@ def micro_kernel_bwd_kv(
     block_q = tl.load(ptr_q, mask=mask_q, other=0.0)
     block_lse = tl.load(ptr_lse, mask=mask_d, other=0.0)
     block_s = tl.dot(block_q, block_k).to(HIGH_TYPE) * scale
+    if block_qk is not None:
+        tl.store(block_qk, block_s)
     if block_mask is not None:
         block_s = tl.where(block_mask, block_s, -1.0e6)
         tl.compile_hint(block_s, "bitwise_mask")
+        if block_qk_mask is not None:
+            tl.store(block_qk_mask, block_s)
     block_do = tl.load(ptr_do, mask=mask_q, other=0.0)
     block_p = tl.exp(block_s - block_lse[:, None])
     block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
@@ -520,9 +526,9 @@ def kernel_da_bwd_q_u(
     BLOCK_SIZE: tl.constexpr,
     LOW_TYPE: tl.constexpr = tl.bfloat16,
     HIGH_TYPE: tl.constexpr = tl.float32,
-    tmp_qk = None,
-    tmp_qk_mask = None,
-    STRIDE_QK: tl.constexpr = 0,
+    # tmp_qk = None,
+    # tmp_qk_mask = None,
+    # STRIDE_QK: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
     pnum = tl.num_programs(axis=0)
@@ -576,10 +582,10 @@ def kernel_da_bwd_q_u(
             block_d = tl.load(ptr_d, mask=mask_d, other=0.0)
             block_dq = tl.full([BLOCK_R, H], 0.0, dtype=HIGH_TYPE)
 
-            offs_qk = (
-                (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_QK
-                + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[None, :]
-            )
+            # offs_qk = (
+            #     (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_QK
+            #     + (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[None, :]
+            # )
 
             block_dq = micro_kernel_bwd_q(
                 block_q,
@@ -605,14 +611,14 @@ def kernel_da_bwd_q_u(
                 BLOCK_R,
                 LOW_TYPE,
                 HIGH_TYPE,
-                block_qk = tmp_qk + offs_qk,
-                block_qk_mask = tmp_qk_mask + offs_qk,
+                # block_qk = tmp_qk + offs_qk,
+                # block_qk_mask = tmp_qk_mask + offs_qk,
             )
 
-            offs_qk = (
-                (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_QK
-                + (S + seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[None, :]
-            )
+            # offs_qk = (
+            #     (seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[:, None] * STRIDE_QK
+            #     + (S + seq_st + idx_r * BLOCK_R + tl.arange(0, BLOCK_R))[None, :]
+            # )
 
             block_dq = micro_kernel_bwd_q(
                 block_q,
@@ -638,8 +644,8 @@ def kernel_da_bwd_q_u(
                 BLOCK_R,
                 LOW_TYPE,
                 HIGH_TYPE,
-                block_qk = tmp_qk + offs_qk,
-                block_qk_mask = tmp_qk_mask + offs_qk,
+                # block_qk = tmp_qk + offs_qk,
+                # block_qk_mask = tmp_qk_mask + offs_qk,
             )
 
             for idx_tile_r in range(idx_r * BLOCK_R // BLOCK_C * BLOCK_C // BLOCK_R, idx_r):
@@ -751,6 +757,9 @@ def kernel_da_bwd_kv_ul(
     BLOCK_SIZE: tl.constexpr,
     LOW_TYPE: tl.constexpr = tl.bfloat16,
     HIGH_TYPE: tl.constexpr = tl.float32,
+    tmp_qk = None,
+    tmp_qk_mask = None,
+    STRIDE_QK: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
     pnum = tl.num_programs(axis=0)
@@ -812,6 +821,11 @@ def kernel_da_bwd_kv_ul(
             for idx_ingroup in range(GROUP_SIZE):
                 idx_n = idx_group * GROUP_SIZE + idx_ingroup
 
+                offs_qk = (
+                    (seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None] * STRIDE_QK
+                    + (seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[None, :]
+                )
+
                 block_dk, block_dv = micro_kernel_bwd_kv(
                     q,
                     block_k,
@@ -835,6 +849,8 @@ def kernel_da_bwd_kv_ul(
                     BLOCK_C,
                     LOW_TYPE,
                     HIGH_TYPE,
+                    block_qk = tmp_qk + offs_qk,
+                    block_qk_mask = tmp_qk_mask + offs_qk,
                 )
 
             tl.store(ptr_dk, block_dk.to(LOW_TYPE), mask=mask_kv)
@@ -893,6 +909,9 @@ def kernel_da_bwd_kv_ur(
     BLOCK_SIZE: tl.constexpr,
     LOW_TYPE: tl.constexpr = tl.bfloat16,
     HIGH_TYPE: tl.constexpr = tl.float32,
+    tmp_qk = None,
+    tmp_qk_mask = None,
+    STRIDE_QK: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
     pnum = tl.num_programs(axis=0)
@@ -954,6 +973,11 @@ def kernel_da_bwd_kv_ur(
             for idx_ingroup in range(GROUP_SIZE):
                 idx_n = idx_group * GROUP_SIZE + idx_ingroup
 
+                offs_qk = (
+                    (seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None] * STRIDE_QK
+                    + (S + seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None]
+                )
+
                 block_dk, block_dv = micro_kernel_bwd_kv(
                     q,
                     block_k,
@@ -977,6 +1001,8 @@ def kernel_da_bwd_kv_ur(
                     BLOCK_C,
                     LOW_TYPE,
                     HIGH_TYPE,
+                    block_qk = tmp_qk + offs_qk,
+                    block_qk_mask = tmp_qk_mask + offs_qk,
                 )
 
                 for idx_tile_r in range(idx_c + 1, (idx_c * BLOCK_C // BLOCK_R + 1) * BLOCK_R // BLOCK_C):
@@ -1262,13 +1288,10 @@ def dllm_attention_up_bwd_impl(
         d.stride(1),
         dllm_attention_up_bwd_impl.mask_ul.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
-        tmp_qk=tmp_qk,
-        tmp_qk_mask=tmp_qk_mask,
-        STRIDE_QK=tmp_qk.stride(0),
+        # tmp_qk=tmp_qk,
+        # tmp_qk_mask=tmp_qk_mask,
+        # STRIDE_QK=tmp_qk.stride(0),
     )
-
-    torch.save(tmp_qk, '/tmp/qk_bit.pt')
-    torch.save(tmp_qk_mask, '/tmp/qk_mask_bit.pt')
 
     kernel_da_bwd_kv_ul[(num_cores,)](
         q,
@@ -1300,6 +1323,9 @@ def dllm_attention_up_bwd_impl(
         d.stride(1),
         dllm_attention_up_bwd_impl.mask_ul.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
+        tmp_qk=tmp_qk,
+        tmp_qk_mask=tmp_qk_mask,
+        STRIDE_QK=tmp_qk.stride(0),
     )
     kernel_da_bwd_kv_ur[(num_cores,)](
         q,
@@ -1331,6 +1357,12 @@ def dllm_attention_up_bwd_impl(
         d.stride(1),
         dllm_attention_up_bwd_impl.mask_ur.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
+        tmp_qk=tmp_qk,
+        tmp_qk_mask=tmp_qk_mask,
+        STRIDE_QK=tmp_qk.stride(0),
     )
+
+    torch.save(tmp_qk, '/tmp/qk_bit.pt')
+    torch.save(tmp_qk_mask, '/tmp/qk_mask_bit.pt')
 
     return dq, dk, dv
