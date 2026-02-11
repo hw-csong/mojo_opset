@@ -106,8 +106,8 @@ def micro_kernel_bwd_q(
     BLOCK_C: tl.constexpr,
     LOW_TYPE,
     HIGH_TYPE,
-    block_qk,
-    block_qk_mask,
+    block_qk = None,
+    block_qk_mask = None,
 ):
     ptr_k = (
         k
@@ -474,6 +474,7 @@ def kernel_da_bwd_d(
     configs=[
         triton.Config(
             {"BLOCK_R": 32, "BLOCK_C": 64},
+            enable_auto_bin_sub_block=False
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
