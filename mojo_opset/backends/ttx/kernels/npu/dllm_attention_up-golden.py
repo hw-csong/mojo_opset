@@ -127,7 +127,7 @@ def micro_kernel_bwd_q(
     tl.store(block_qk, block_s)
     if block_mask is not None:
         block_s = tl.where(block_mask, block_s, -1.0e6)
-        tl.compile_hint(block_s, "bitwise_mask")
+        # tl.compile_hint(block_s, "bitwise_mask")
         tl.store(block_qk_mask, block_s)
     block_p = tl.exp(block_s - block_lse[:, None])
     block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
@@ -179,7 +179,7 @@ def micro_kernel_bwd_kv(
     block_s = tl.dot(block_q, block_k).to(HIGH_TYPE) * scale
     if block_mask is not None:
         block_s = tl.where(block_mask, block_s, -1.0e6)
-        tl.compile_hint(block_s, "bitwise_mask")
+        # tl.compile_hint(block_s, "bitwise_mask")
     block_do = tl.load(ptr_do, mask=mask_q, other=0.0)
     block_p = tl.exp(block_s - block_lse[:, None])
     block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
@@ -1105,10 +1105,8 @@ def dllm_attention_up_bwd_impl(
         offset_c_local = torch.arange(0, BLOCK_MASK)[None, :]
         chunk_idx_r = offset_r_local // BLOCK_SIZE
         chunk_idx_c = offset_c_local // BLOCK_SIZE
-        mask_ul_i8 = packed_bool_to_i8((chunk_idx_r == chunk_idx_c))
-        mask_ur_i8 = packed_bool_to_i8((chunk_idx_r > chunk_idx_c))
-        dllm_attention_up_bwd_impl.mask_ul = (mask_ul_i8).to(q.device)
-        dllm_attention_up_bwd_impl.mask_ur = (mask_ur_i8).to(q.device)
+        dllm_attention_up_bwd_impl.mask_ul = (chunk_idx_r == chunk_idx_c).to(q.device)
+        dllm_attention_up_bwd_impl.mask_ur = (chunk_idx_r > chunk_idx_c).to(q.device)
 
     kernel_da_bwd_d[(num_vectorcore,)](
         fp32o,
@@ -1162,7 +1160,7 @@ def dllm_attention_up_bwd_impl(
         STRIDE_QK=tmp_qk.stride(0),
     )
 
-    torch.save(tmp_qk, 'qk.pt')
-    torch.save(tmp_qk_mask, 'qk_mask.pt')
+    torch.save(tmp_qk, 'qk_bit.pt')
+    torch.save(tmp_qk_mask, 'qk_mask_bit.pt')
 
     return dq, dk, dv
