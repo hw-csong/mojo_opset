@@ -182,7 +182,7 @@ def micro_kernel_bwd_kv(
     block_s = tl.dot(block_q, block_k).to(HIGH_TYPE) * scale
     if block_mask is not None:
         block_s = tl.where(block_mask, block_s, -1.0e6)
-        # tl.compile_hint(block_s, "bitwise_mask")
+        tl.compile_hint(block_s, "bitwise_mask")
     block_do = tl.load(ptr_do, mask=mask_q, other=0.0)
     block_p = tl.exp(block_s - block_lse[:, None])
     block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
@@ -474,7 +474,7 @@ def kernel_da_bwd_d(
     configs=[
         triton.Config(
             {"BLOCK_R": 32, "BLOCK_C": 64},
-            enable_auto_bin_sub_block=False
+            enable_auto_bin_sub_block=False,
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -705,6 +705,7 @@ def kernel_da_bwd_q_u(
     configs=[
         triton.Config(
             {"BLOCK_R": 64, "BLOCK_C": 32},
+            enable_auto_bin_sub_block=False,
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -846,6 +847,7 @@ def kernel_da_bwd_kv_ul(
     configs=[
         triton.Config(
             {"BLOCK_R": 64, "BLOCK_C": 32},
+            enable_auto_bin_sub_block=False,
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -1210,8 +1212,8 @@ def dllm_attention_up_bwd_impl(
         mask_ur_i8 = packed_bool_to_i8((chunk_idx_r > chunk_idx_c), block_num=1)
         dllm_attention_up_bwd_impl.mask_ul = (mask_ul_i8).to(q.device)
         dllm_attention_up_bwd_impl.mask_ur = (mask_ur_i8).to(q.device)
-        dllm_attention_up_bwd_impl.mask_ul_bool = (chunk_idx_r == chunk_idx_c).to(q.device)
-        dllm_attention_up_bwd_impl.mask_ur_bool = (chunk_idx_r > chunk_idx_c).to(q.device)
+        # dllm_attention_up_bwd_impl.mask_ul_bool = (chunk_idx_r == chunk_idx_c).to(q.device)
+        # dllm_attention_up_bwd_impl.mask_ur_bool = (chunk_idx_r > chunk_idx_c).to(q.device)
 
     kernel_da_bwd_d[(num_vectorcore,)](
         fp32o,
@@ -1280,7 +1282,7 @@ def dllm_attention_up_bwd_impl(
         cu_seqlen,
         cu_seqlen.shape[0],
         scale,
-        dllm_attention_up_bwd_impl.mask_ul_bool,
+        dllm_attention_up_bwd_impl.mask_ul,
         q.shape[1] // k.shape[1],
         q.shape[0] // 2,
         q.shape[1],
@@ -1296,7 +1298,7 @@ def dllm_attention_up_bwd_impl(
         v.stride(2),
         d.stride(0),
         d.stride(1),
-        dllm_attention_up_bwd_impl.mask_ul_bool.stride(0),
+        dllm_attention_up_bwd_impl.mask_ul.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
     )
     kernel_da_bwd_kv_ur[(num_cores,)](
@@ -1311,7 +1313,7 @@ def dllm_attention_up_bwd_impl(
         cu_seqlen,
         cu_seqlen.shape[0],
         scale,
-        dllm_attention_up_bwd_impl.mask_ur_bool,
+        dllm_attention_up_bwd_impl.mask_ur,
         q.shape[1] // k.shape[1],
         q.shape[0] // 2,
         q.shape[1],
@@ -1327,7 +1329,7 @@ def dllm_attention_up_bwd_impl(
         v.stride(2),
         d.stride(0),
         d.stride(1),
-        dllm_attention_up_bwd_impl.mask_ur_bool.stride(0),
+        dllm_attention_up_bwd_impl.mask_ur.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
