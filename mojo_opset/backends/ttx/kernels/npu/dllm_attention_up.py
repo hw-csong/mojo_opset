@@ -125,13 +125,9 @@ def micro_kernel_bwd_q(
     mask_kv = (offset_c + tl.arange(0, BLOCK_C))[:, None] < offset_c_ed
     block_k = tl.load(ptr_k, mask=mask_kv, other=0.0)
     block_s = tl.dot(block_q, block_k.T).to(HIGH_TYPE) * scale
-    if block_qk is not None:
-        tl.store(block_qk, block_s)
     if block_mask is not None:
         block_s = tl.where(block_mask, block_s, -1.0e6)
         tl.compile_hint(block_s, "bitwise_mask")
-        if block_qk_mask is not None:
-            tl.store(block_qk_mask, block_s)
     block_p = tl.exp(block_s - block_lse[:, None])
     block_v = tl.load(ptr_v, mask=mask_kv, other=0.0)
     block_dp = tl.dot(block_do, block_v.T).to(HIGH_TYPE)
@@ -182,13 +178,9 @@ def micro_kernel_bwd_kv(
     block_q = tl.load(ptr_q, mask=mask_q, other=0.0)
     block_lse = tl.load(ptr_lse, mask=mask_d, other=0.0)
     block_s = tl.dot(block_q, block_k).to(HIGH_TYPE) * scale
-    if block_qk is not None:
-        tl.store(block_qk, block_s)
     if block_mask is not None:
         block_s = tl.where(block_mask, block_s, -1.0e6)
         tl.compile_hint(block_s, "bitwise_mask")
-        if block_qk_mask is not None:
-            tl.store(block_qk_mask, block_s)
     block_do = tl.load(ptr_do, mask=mask_q, other=0.0)
     block_p = tl.exp(block_s - block_lse[:, None])
     block_dv += tl.dot(block_p.to(LOW_TYPE).T, block_do).to(HIGH_TYPE)
@@ -426,7 +418,7 @@ def kernel_da_fwd_u(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 32},
+            {"BLOCK_R": 64},
         ),
     ],
     key=["N", "H"],
@@ -479,8 +471,7 @@ def kernel_da_bwd_d(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 32, "BLOCK_C": 64},
-            enable_auto_bin_sub_block=False,
+            {"BLOCK_R": 64, "BLOCK_C": 256},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -710,8 +701,7 @@ def kernel_da_bwd_q_u(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 64, "BLOCK_C": 32},
-            enable_auto_bin_sub_block=False,
+            {"BLOCK_R": 256, "BLOCK_C": 64},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -757,9 +747,6 @@ def kernel_da_bwd_kv_ul(
     BLOCK_SIZE: tl.constexpr,
     LOW_TYPE: tl.constexpr = tl.bfloat16,
     HIGH_TYPE: tl.constexpr = tl.float32,
-    tmp_qk = None,
-    tmp_qk_mask = None,
-    STRIDE_QK: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
     pnum = tl.num_programs(axis=0)
@@ -821,11 +808,6 @@ def kernel_da_bwd_kv_ul(
             for idx_ingroup in range(GROUP_SIZE):
                 idx_n = idx_group * GROUP_SIZE + idx_ingroup
 
-                offs_qk = (
-                    (seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None] * STRIDE_QK
-                    + (seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[None, :]
-                )
-
                 block_dk, block_dv = micro_kernel_bwd_kv(
                     q,
                     block_k,
@@ -849,8 +831,6 @@ def kernel_da_bwd_kv_ul(
                     BLOCK_C,
                     LOW_TYPE,
                     HIGH_TYPE,
-                    block_qk = tmp_qk + offs_qk,
-                    block_qk_mask = tmp_qk_mask + offs_qk,
                 )
 
             tl.store(ptr_dk, block_dk.to(LOW_TYPE), mask=mask_kv)
@@ -862,8 +842,7 @@ def kernel_da_bwd_kv_ul(
 @triton.autotune(
     configs=[
         triton.Config(
-            {"BLOCK_R": 64, "BLOCK_C": 32},
-            enable_auto_bin_sub_block=False,
+            {"BLOCK_R": 256, "BLOCK_C": 64},
             # multibuffer=True,
             # unit_flag=True,
             # set_workspace_multibuffer=2,
@@ -973,11 +952,6 @@ def kernel_da_bwd_kv_ur(
             for idx_ingroup in range(GROUP_SIZE):
                 idx_n = idx_group * GROUP_SIZE + idx_ingroup
 
-                offs_qk = (
-                    (seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None] * STRIDE_QK
-                    + (S + seq_st + idx_c * BLOCK_C + tl.arange(0, BLOCK_C))[:, None]
-                )
-
                 block_dk, block_dv = micro_kernel_bwd_kv(
                     q,
                     block_k,
@@ -1001,8 +975,6 @@ def kernel_da_bwd_kv_ur(
                     BLOCK_C,
                     LOW_TYPE,
                     HIGH_TYPE,
-                    block_qk = tmp_qk + offs_qk,
-                    block_qk_mask = tmp_qk_mask + offs_qk,
                 )
 
                 for idx_tile_r in range(idx_c + 1, (idx_c * BLOCK_C // BLOCK_R + 1) * BLOCK_R // BLOCK_C):
@@ -1229,17 +1201,15 @@ def dllm_attention_up_bwd_impl(
 
     if (not hasattr(dllm_attention_up_bwd_impl, "inited")):
         dllm_attention_up_bwd_impl.inited = True
-        BLOCK_MASK = 32
+        BLOCK_MASK = 64
         offset_r_local = torch.arange(0, BLOCK_MASK)[:, None]
         offset_c_local = torch.arange(0, BLOCK_MASK)[None, :]
         chunk_idx_r = offset_r_local // BLOCK_SIZE
         chunk_idx_c = offset_c_local // BLOCK_SIZE
-        mask_ul_i8 = packed_bool_to_i8((chunk_idx_r == chunk_idx_c), block_num=1)
-        mask_ur_i8 = packed_bool_to_i8((chunk_idx_r > chunk_idx_c), block_num=1)
+        mask_ul_i8 = packed_bool_to_i8((chunk_idx_r == chunk_idx_c), block_num=2)
+        mask_ur_i8 = packed_bool_to_i8((chunk_idx_r > chunk_idx_c), block_num=2)
         dllm_attention_up_bwd_impl.mask_ul = (mask_ul_i8).to(q.device)
         dllm_attention_up_bwd_impl.mask_ur = (mask_ur_i8).to(q.device)
-        # dllm_attention_up_bwd_impl.mask_ul_bool = (chunk_idx_r == chunk_idx_c).to(q.device)
-        # dllm_attention_up_bwd_impl.mask_ur_bool = (chunk_idx_r > chunk_idx_c).to(q.device)
 
     kernel_da_bwd_d[(num_vectorcore,)](
         fp32o,
@@ -1255,8 +1225,8 @@ def dllm_attention_up_bwd_impl(
         d.stride(1),
     )
 
-    tmp_qk = torch.zeros((q.shape[0], k.shape[0]), dtype=torch.float32, device=q.device)
-    tmp_qk_mask = torch.zeros((q.shape[0], k.shape[0]), dtype=torch.float32, device=q.device)
+    # tmp_qk = torch.zeros((q.shape[0], k.shape[0]), dtype=torch.float32, device=q.device)
+    # tmp_qk_mask = torch.zeros((q.shape[0], k.shape[0]), dtype=torch.float32, device=q.device)
 
     kernel_da_bwd_q_u[(num_cores,)](
         q,
@@ -1288,9 +1258,6 @@ def dllm_attention_up_bwd_impl(
         d.stride(1),
         dllm_attention_up_bwd_impl.mask_ul.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
-        # tmp_qk=tmp_qk,
-        # tmp_qk_mask=tmp_qk_mask,
-        # STRIDE_QK=tmp_qk.stride(0),
     )
 
     kernel_da_bwd_kv_ul[(num_cores,)](
@@ -1323,9 +1290,6 @@ def dllm_attention_up_bwd_impl(
         d.stride(1),
         dllm_attention_up_bwd_impl.mask_ul.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
-        tmp_qk=tmp_qk,
-        tmp_qk_mask=tmp_qk_mask,
-        STRIDE_QK=tmp_qk.stride(0),
     )
     kernel_da_bwd_kv_ur[(num_cores,)](
         q,
@@ -1357,12 +1321,6 @@ def dllm_attention_up_bwd_impl(
         d.stride(1),
         dllm_attention_up_bwd_impl.mask_ur.stride(0),
         BLOCK_SIZE=BLOCK_SIZE,
-        tmp_qk=tmp_qk,
-        tmp_qk_mask=tmp_qk_mask,
-        STRIDE_QK=tmp_qk.stride(0),
     )
-
-    torch.save(tmp_qk, '/tmp/qk_bit.pt')
-    torch.save(tmp_qk_mask, '/tmp/qk_mask_bit.pt')
 
     return dq, dk, dv
